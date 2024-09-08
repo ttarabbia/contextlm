@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::Path;
 
 use dotenv::dotenv;
+use pdf_extract;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -13,98 +14,166 @@ use serde_json::json;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     // let response = call_gemini(&"tell me about Oauth2".to_string(), &"Oauth2".to_string()).await?;
-    //
     // for text in &response {
     //     println!("Extracted: \n {} \n", text);
     // }
-    let input_file_path = "scraped_urls.txt";
 
-    let first_page = "https://texreg.sos.state.tx.us/public/readtac$ext.TacPage?sl=T&app=9&p_dir=N&p_rloc=199238&p_tloc=&p_ploc=1&pg=2&p_tac=&ti=30&pt=1&ch=1&rl=1";
-    let start_url = get_start_url("scraped_urls.txt", &first_page).await;
-    let mut current_url = start_url;
-    let mut all_urls = Vec::new();
-    let max_pages = 1000; // Set this to your desired limit
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(input_file_path)?;
-
-    for _ in 0..max_pages {
-        let graphic_urls = add_attached_graphics_urls(&current_url, &mut all_urls).await?;
-
-        for url in graphic_urls {
-            writeln!(file, "{}", url)?;
-        }
-
-        all_urls.push(current_url.clone());
-        println!("Processing: {}", current_url);
-
-        writeln!(file, "{}", current_url)?;
-        match extract_next_url(&current_url).await? {
-            Some(next_url) => {
-                current_url = next_url;
-            }
-            None => break,
-        }
-    }
-    println!("Total URLs processed: {}", all_urls.len());
-    println!("all Urls: {:?}", all_urls);
-
-    let deduped_file = dedupe_file(&input_file_path).await?;
-
-    let input_file = File::open(deduped_file)?;
-    let reader = BufReader::new(input_file);
-
-
-    let lines = reader.lines().collect::<Result<Vec<String>, io::Error>>()?;
-
-    let max_concurrent_tasks = 100;
-
-    // let results = 
-
-
-
-
-
+    scrape_and_save().await?;
 
     Ok(())
 }
 
-async fn html_to_markdown(url: &str) ->  Result<(String, String), Box<dyn std::error::Error>>{
+async fn scrape_and_save() -> Result<String, Box<dyn std::error::Error>> {
+    let folder = "data".to_string();
+    let input_file_path = format!("{}/scraped_urls.txt", &folder);
+    let first_page = "https://texreg.sos.state.tx.us/public/readtac$ext.TacPage?sl=T&app=9&p_dir=N&p_rloc=199238&p_tloc=&p_ploc=1&pg=2&p_tac=&ti=30&pt=1&ch=1&rl=1";
 
-    let resp = reqwest::get(url).await?.text().await?;
-    let document = Html::parse_document(&resp);
+    let start_url = get_start_url(&format!("{}/scraped_urls.txt", &folder), &first_page).await;
+    let url_file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(input_file_path)?;
 
-    let content_selector = Selector::parse("body").unwrap();
+    //Loop start
+    let mut carrier_url: Option<String> = Some(start_url.clone());
 
+    while carrier_url.is_some() {
+        let current_url = carrier_url.unwrap();
+        //Reqwest(start_url)
+        println!("{}", &current_url);
+        let resp = reqwest::get(&current_url).await?.text().await?;
+        //Clean HTML(response)
+        let document = Html::parse_document(&resp);
+        let cleaned_document = clean_html(&document).await?;
+        //find_title(&html)
+        let filename = find_title(&document).await?;
+        //handle_attached_graphics
+        handle_attached_graphics(
+            &cleaned_document,
+            &url_file,
+            &filename,
+            &folder,
+            &current_url,
+        )
+        .await?;
 
+        //html_to_md(&title, &html)
+        let markdown = html_to_md(&cleaned_document).await?;
+        //Clean MD()
+
+        //save to file
+        save_file_to_path(&filename, &folder, &markdown).await?;
+
+        //Look for next URL
+        match extract_next_url(&current_url).await? {
+            Some(next_url) => {
+                writeln!(&url_file, "{}", current_url)?;
+                carrier_url = Some(next_url);
+            }
+            None => carrier_url = None,
+        }
+    }
+
+    Ok("Yay".to_string())
+}
+async fn handle_attached_graphics(
+    document: &String,
+    mut url_file: &File,
+    filename: &String,
+    folder: &String,
+    url: &String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut graphics_urls = Vec::new();
+    let document = Html::parse_document(&document);
+    let base_url = url.split('/').take(3).collect::<Vec<&str>>().join("/");
+
+    // Selector for <a> tags
+    let a_selector = Selector::parse("a").unwrap();
+
+    // Iterate through all <a> tags and check their text
+    for a in document.select(&a_selector) {
+        if a.text().collect::<String>() == "Attached Graphic" {
+            if let Some(href) = a.value().attr("href") {
+                let attached_graphic_url = format!("{}{}", base_url, href.to_string());
+                println!("Attached Graphic! {}", &attached_graphic_url);
+                if href.ends_with(".pdf") {
+                    // Download the PDF if it ends with `.pdf`
+                    println!("Downloading PDF: {}", &attached_graphic_url);
+                    download_pdf(&attached_graphic_url, &href, &filename).await?;
+                } else {
+                    // If it's not a PDF, call html_to_markdown
+                    println!("Processing HTML as Markdown: {}", &attached_graphic_url);
+                    let resp = reqwest::get(&attached_graphic_url).await?.text().await?;
+                    let document = Html::parse_document(&resp);
+                    let cleaned_document = clean_html(&document).await?;
+                    let markdown = html_to_md(&cleaned_document).await?;
+                    save_file_to_path(&filename, &folder, &markdown).await?;
+                }
+
+                graphics_urls.push(attached_graphic_url.clone());
+                writeln!(url_file, "{}", attached_graphic_url)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn clean_html(document: &scraper::html::Html) -> Result<String, Box<dyn std::error::Error>> {
     let remove_selectors = vec![
         Selector::parse("script").unwrap(),
+        Selector::parse("input").unwrap(),
         Selector::parse("style").unwrap(),
         Selector::parse("nav").unwrap(),
         Selector::parse("header").unwrap(),
         Selector::parse("footer").unwrap(),
-        Selector::parse("center").unwrap()
+        Selector::parse("center").unwrap(),
+        Selector::parse("noscript").unwrap(),
+        Selector::parse("center").unwrap(),
+        Selector::parse("center").unwrap(),
+        Selector::parse("center").unwrap(),
     ];
 
-
-    let mut cleaned_html = document.root_element().html();
+    let mut cleaned_document = document.root_element().html();
 
     for selector in remove_selectors {
         document.select(&selector).for_each(|element| {
             let html_to_remove = element.html();
-            cleaned_html = cleaned_html.replace(&html_to_remove, "");
+            cleaned_document = cleaned_document.replace(&html_to_remove, "");
         });
     }
 
-    let cleaned_document = Html::parse_document(&cleaned_html);
+    // println!("{}", cleaned_html);
+    Ok(cleaned_document)
+}
 
-    let main_content = cleaned_document.select(&content_selector).next().ok_or("Could not find main content")?;
+async fn save_file_to_path(
+    filename: &String,
+    folder: &String,
+    markdown: &String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{}/{}.md", folder, &filename);
+    let path = Path::new(&path);
+    let mut file = File::create(path)?;
+    file.write_all(markdown.as_bytes())?;
+    Ok(())
+}
+
+async fn html_to_md(cleaned_document: &String) -> Result<String, Box<dyn std::error::Error>> {
+    let cleaned_document = Html::parse_document(&cleaned_document);
+    let content_selector = Selector::parse("body").unwrap();
+    let main_content = cleaned_document
+        .select(&content_selector)
+        .next()
+        .ok_or("Could not find main content")?;
 
     let markdown = html2md::parse_html(&main_content.inner_html());
 
+    Ok(markdown)
+}
 
-      let table_selector = Selector::parse("table[align='CENTER'][cellpadding='0']").unwrap();
+async fn find_title(document: &scraper::html::Html) -> Result<String, Box<dyn std::error::Error>> {
+    let table_selector = Selector::parse("table[align='CENTER']").unwrap();
     let row_selector = Selector::parse("tr").unwrap();
     let td_selector = Selector::parse("td").unwrap();
 
@@ -116,25 +185,27 @@ async fn html_to_markdown(url: &str) ->  Result<(String, String), Box<dyn std::e
             if let (Some(left), Some(right)) = (tds.next(), tds.next()) {
                 let left_text = left.text().collect::<String>().trim().to_string();
                 let right_text = right.text().collect::<String>().trim().to_string();
-                
-                if left_text.starts_with("CHAPTER") || left_text.starts_with("SUBCHAPTER") || left_text.starts_with("RULE") {
-                    title_parts.push(format!("{}_{}", left_text, right_text));
+
+                // println!("LEFT: {}", &left_text);
+                // println!("RIGHT: {}", &right_text);
+                if left_text.contains("CHAPTER")
+                    || left_text.contains("SUBCHAPTER")
+                    || left_text.contains("RULE")
+                {
+                    let truncated: String = right_text.chars().take(50).collect();
+
+                    title_parts.push(format!("{}_{}", left_text, truncated));
                 }
             }
         }
     }
 
     let filename = title_parts.join("_").replace(" ", "_");
-    let path = format!("data/{}-", &filename);
-    let path = Path::new(&path);
-    let mut file = File::create(path)?;
-    file.write_all(markdown.as_bytes())?;
 
-    Ok((filename, markdown))
-
+    Ok(filename)
 }
 
-async fn dedupe_file(file_path: &str) -> Result<String, Box<dyn std::error::Error>>{
+async fn dedupe_file(file_path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let input_file = File::open(file_path)?;
 
     let reader = BufReader::new(input_file);
@@ -146,10 +217,10 @@ async fn dedupe_file(file_path: &str) -> Result<String, Box<dyn std::error::Erro
         unique_lines.insert(line);
     }
 
-    let deduped_file = "deduped_urls.txt".to_string();
+    let deduped_file = "data/deduped_urls.txt".to_string();
     let mut output_file = File::create(&deduped_file)?;
 
-    for line in unique_lines{
+    for line in unique_lines {
         writeln!(output_file, "{}", line)?;
     }
 
@@ -168,7 +239,7 @@ async fn extract_next_url(url: &str) -> Result<Option<String>, Box<dyn std::erro
     let a_selector = Selector::parse("a").unwrap();
     let td_selector = Selector::parse("body center table tbody tr td[align='RIGHT']").unwrap();
 
-    // Check for <pre> tags and extract href
+    // Look for Next Page and go there first, before going to next Rule
     if let Some(pre) = document.select(&pre_selector).next() {
         if let Some(a) = pre
             .select(&a_selector)
@@ -180,7 +251,7 @@ async fn extract_next_url(url: &str) -> Result<Option<String>, Box<dyn std::erro
         }
     }
 
-    // Check for the original td tag and extract href
+    //IF no Next Page found - then go to next rule
     for td in document.select(&td_selector) {
         if let Some(a) = td.select(&a_selector).next() {
             if let Some(href) = a.value().attr("href") {
@@ -192,35 +263,53 @@ async fn extract_next_url(url: &str) -> Result<Option<String>, Box<dyn std::erro
     Ok(None)
 }
 
-async fn add_attached_graphics_urls(
+async fn download_pdf(
     url: &str,
-    all_urls: &mut Vec<String>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(url).await?.text().await?;
-    let document = Html::parse_document(&resp);
-    let base_url = url.split('/').take(3).collect::<Vec<&str>>().join("/");
-    let mut graphics_urls = Vec::new();
+    href: &str,
+    parent_filename: &String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = reqwest::get(url).await?;
+    let pdf_data = response.bytes().await?;
 
-    // Selector for <a> tags
-    let a_selector = Selector::parse("a").unwrap();
+    let filename = href
+        .split('/')
+        .last()
+        .unwrap_or("unknown")
+        .replace(" ", "_");
 
-    // Iterate through all <a> tags and check their text
-    for a in document.select(&a_selector) {
-        if a.text().collect::<String>() == "Attached Graphic" {
-            if let Some(href) = a.value().attr("href") {
-                println!("{}", base_url);
-                let attached_graphic_url = format!("{}{}", base_url, href.to_string());
-                println!("Attached Graphic! {}", &attached_graphic_url);
-                graphics_urls.push(attached_graphic_url.clone());
-                all_urls.push(attached_graphic_url.clone());
-            }
+    let folder = "data".to_string();
+    let path = format!("{}-{}", parent_filename, filename);
+    let full_path = format!("{}/{}", &folder, &path);
+    // println!("Saving PDF to: {}", full_path);
+
+    let mut file = File::create(Path::new(&full_path))?;
+    file.write_all(&pdf_data)?;
+
+    let pdf_text = fetch_pdf_as_text(&url).await?;
+    save_file_to_path(&path, &folder, &pdf_text).await?;
+
+    Ok(())
+}
+
+async fn fetch_pdf_as_text(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Download the PDF from the URL
+    let response = reqwest::get(url).await?;
+    let bytes = response.bytes().await?;
+
+    // Convert the PDF bytes into text
+    // let cursor = Cursor::new(bytes);
+    // let mut output = Vec::new();
+    match pdf_extract::extract_text_from_mem(&bytes) {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            eprintln!("Error extracting {:?}", e);
+            Err(Box::new(e))
         }
     }
 
-    Ok(graphics_urls)
 }
 
-async fn get_start_url(file_path: &str, default_url: &str) -> String {
+async fn get_start_url(file_path: &String, default_url: &str) -> String {
     let file = File::open(file_path);
 
     match file {
@@ -249,141 +338,6 @@ async fn get_start_url(file_path: &str, default_url: &str) -> String {
         }
     }
 }
-
-// async fn scrape_urls(url: &String) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-//
-//     let resp = reqwest::get(url).await?.text().await?;
-//     let document = Html::parse_document(&resp);
-//     let base_url = url.split("readtac").next().unwrap_or("");
-//
-//     let td_selector = Selector::parse("body center table tbody tr td[align='RIGHT']").unwrap();
-//     let a_selector = Selector::parse("a").unwrap();
-//
-//     let mut urls = Vec::new();
-//
-//     for td in document.select(&td_selector){
-//         if let Some(a) = td.select(&a_selector).next(){
-//             if let Some(href) = a.value().attr("href"){
-//                 urls.push(format!("{}{}",base_url, href.to_string()));
-//             }
-//         } else {
-//                 break
-//             }
-//     }
-//     println!("{:?}", urls);
-//
-//     Ok(urls)
-// }
-
-// async fn scrape_text_from_urls(
-//     urls: Vec<String>,
-// ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-//     let client = Client::new();
-//     let mut results = Vec::new();
-//     for url in urls {
-//         let response = client.get(&url).send().await?.text().await?;
-//         let document = Html::parse_document(&response);
-//
-//         let td_selector = Selector::parse("td").unwrap();
-//         let a_selector = Selector::parse("a[href^='readtac$ext.ViewTAC']").unwrap();
-//
-//         let mut text_content = String::new();
-//
-//         for td in document.select(&td_selector) {
-//             if let Some(a) = td.select(&a_selector).next() {
-//                 if let Some(href) = a.value().attr("href") {
-//                     if href.contains("ch=") || href.contains("pt=") {
-//                         text_content.push_str(a.text().collect::<String>().trim());
-//                         text_content.push('\n');
-//                     }
-//                 }
-//             } else {
-//                 let mut td_text = String::new();
-//                 collect_text_excluding_elements(td, &mut td_text, &["script", "form", "input"]);
-//                 text_content.push_str(td_text.trim());
-//                 text_content.push('\n');
-//             }
-//         }
-//
-//         results.push(text_content.trim().to_string());
-//     }
-//     Ok(results)
-// }
-
-// Helper function to collect text excluding certain tags
-// fn collect_text_excluding_elements(
-//     node: ego_tree::NodeRef,
-//     text_accumulator: &mut String,
-//     excluded_tags: &[&str],
-// ) {
-//     for child in node.children() {
-//         match child.value() {
-//             scraper::node::Node::Text(text) => {
-//                 text_accumulator.push_str(text);
-//             }
-//             scraper::node::Node::Element(element) => {
-//                 if !excluded_tags.contains(&element.name()) {
-//                     collect_text_excluding_elements(child, text_accumulator, excluded_tags);
-//                 }
-//             }
-//             _ => {}
-//         }
-//     }
-// }
-
-// async fn scrape_text_from_urls(
-//     urls: Vec<String>,
-// ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-//     let client = Client::new();
-//     let mut results = Vec::new();
-//     for url in urls {
-//         let response = client.get(&url).send().await?.text().await?;
-//         let document = Html::parse_document(&response);
-//
-//         let td_selector = Selector::parse("td").unwrap();
-//         let a_selector = Selector::parse("a[href^='readtac$ext.ViewTAC']").unwrap();
-//
-//         let mut text_content = String::new();
-//
-//         for td in document.select(&td_selector) {
-//             if let Some(a) = td.select(&a_selector).next() {
-//                 if let Some(href) = a.value().attr("href") {
-//                     if href.contains("ch=") || href.contains("pt=") {
-//                         text_content.push_str(a.text().collect::<String>().trim());
-//                         text_content.push('\n');
-//                     }
-//                 }
-//             } else {
-//                 let mut td_text = String::new();
-//                 for child in td.children() {
-//                     match child.value() {
-//                         scraper::node::Node::Text(text) => {
-//                             // If the child is a text node, add its content to td_text
-//                             td_text.push_str(text);
-//                         }
-//                         scraper::node::Node::Element(element) => {
-//                             // If the child is an element, check if it's not a <script>, <form>, or <input> tag
-//                             if !["script", "form", "input"].contains(&element.name()) {
-//                                 // Recursively collect text from the element
-//                                 for descendant in child.descendants() {
-//                                     if let Some(text) = descendant.value().as_text() {
-//                                         td_text.push_str(text);
-//                                     }
-//                                 }
-//                             }
-//                         }
-//                         _ => {}
-//                     }
-//                 }
-//                 text_content.push_str(td_text.trim());
-//                 text_content.push('\n');
-//             }
-//         }
-//
-//         results.push(text_content.trim().to_string());
-//     }
-//     Ok(results)
-// }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GeminiResponse {
